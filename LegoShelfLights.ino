@@ -22,6 +22,9 @@ Electronics
 #define NUM_LEDS    3   // Note: I'm using single colour LEDs, so '1 pixel' = 3 LEDs
 
 
+uint8_t modules[NUM_LEDS*3 + 1];  // Stores intensity values for each module - Ideally I'd use the leds arrays to do that, but I don't know where teh raw values of that is stored :(
+                                  // Note: 1 extra module is just to make fade on/off easier to program
+
 Adafruit_NeoPixel leds(NUM_LEDS, PIN_PIXEL, NEO_GRB + NEO_KHZ800);
 
 bool btnState_Last = HIGH;
@@ -30,20 +33,22 @@ bool btnState_Last = HIGH;
 // Parameters
 
 bool lightsOn = 0;                // Current state of lights (on or off)
+bool fadingOnOff = false;         // true while lights are either turning on or turning off
 
 #define LED_FADE_TIME     1000    // (ms) Fade time for an individual module to turn on/off
 #define MODULE_DELAY_TIME 500     // (ms) delay between lighting successive modules
 #define DEBOUNCE          20      // (ms) debounce time
 #define SHORT_PRESS_TIME  500     // (ms) Max period button can be pressed for to trigger on/off action
-#define INTENSITY_MIN     10      // (0-255) Minimum intensity to drop to
-#define FADE_SPEED        20      // kinda speed at which lights fade lower value = faster fade
+#define DIM_MIN           10      // (0-255) Minimum intensity to drop to
+#define DIM_SPEED         20      // kinda speed at which lights fade lower value = faster fade
+#define HALF_POINT        127     // Value at which next module starts fading
 
 uint32_t btnStartTime = 0;
 
 
 void setup() 
 {
-  Serial.begin(115200);
+  // Serial.begin(115200);
   pinMode(PIN_BTN, INPUT_PULLUP);
   leds.begin();       // Initialize Pixels
   leds.show();          // Initialize all pixels to 'off'
@@ -53,53 +58,40 @@ void loop()
 {
   bool btnState = digitalRead(PIN_BTN);
 
-
-  if (!btnState)                    // If button pressed ...
+  if (!fadingOnOff)                   // Don't allow changes while fading off/on
   {
-    if (millis() < btnStartTime)    // (handle timer overflow)
+    if (!btnState)                    // If button pressed ...
     {
-      btnStartTime = millis();
-      Serial.println("\t\t\t OVERFLOW");
-      return;
+      if (millis() < btnStartTime)    // (handle timer overflow)
+      {
+        btnStartTime = millis();
+        return;
+      }
+
+      if (btnState != btnState_Last)  // ... and wasn't previously
+        btnStartTime = millis();      // Record time button was initially pressed
+
+      // If button pressed for longer than ShortPressTime - change intensity
+      else if (millis() - btnStartTime >= SHORT_PRESS_TIME)
+      {
+        if (lightsOn)       
+          ChangeIntensity(millis() - btnStartTime);
+      }
+
     }
-
-    if (btnState != btnState_Last)  // ... and wasn't previously
-      btnStartTime = millis();      // Record time button was initially pressed
-
-    // If button pressed for longer than ShortPressTime - change intensity
-    else if (millis() - btnStartTime >= SHORT_PRESS_TIME)
+    else
     {
-      // Serial.println(F("Long Press"));
-      if (lightsOn)       
-        ChangeIntensity(millis() - btnStartTime);
+      if (btnState != btnState_Last) // Button just released
+      {
+        // Debounce & toggle light state if short press 
+        if (( (millis() - btnStartTime) <= SHORT_PRESS_TIME ) && ( (millis() - btnStartTime) >= DEBOUNCE) ) 
+          lightsOn = !lightsOn;
+      }
     }
-
-  }
-  else
-  {
-    if (btnState != btnState_Last) // Button just released
-    {
-      // Debounce & toggle light state if short press 
-      if (( (millis() - btnStartTime) <= SHORT_PRESS_TIME ) && ( (millis() - btnStartTime) >= DEBOUNCE) ) 
-        lightsOn = !lightsOn;
-    }
-
-
-
-
   }
 
   btnState_Last = btnState;         // Record btnState for next time
   updateLEDs();
-
-
-
-  // Serial.print(F("The light is "));
-  // if (lightsOn)
-  //  Serial.println("on");
-  // else
-  //  Serial.println("off");
-
 
 }
 
@@ -113,8 +105,6 @@ void ChangeIntensity(uint16_t pressTime)
   static uint8_t  intensity_preset = 255;     // Preset intensity to fade lights up to when toggled on
   static uint8_t  intensity_initial;          // Intensity_preset value at start of long button press event
 
-  // Serial.print("pressTime = ");
-  // Serial.println(pressTime);
 
   if (pressTime < pressTime_last)             // Reset if new button press event
   {
@@ -127,7 +117,6 @@ void ChangeIntensity(uint16_t pressTime)
   pressTime_last = pressTime;                 // Remember for next time
 
 
-
   if (fadeUp)                                 // Stop fading if we hit an end
   {
     if (intensity_preset >= 255)              
@@ -135,7 +124,7 @@ void ChangeIntensity(uint16_t pressTime)
   }
   else //fade down
   {
-    if (intensity_preset <= INTENSITY_MIN)
+    if (intensity_preset <= DIM_MIN)
       stopFade = true;
   }
 
@@ -143,15 +132,12 @@ void ChangeIntensity(uint16_t pressTime)
   if (!stopFade)
   {
     if (fadeUp)
-      intensity_preset = intensity_initial + ((pressTime - SHORT_PRESS_TIME) / FADE_SPEED);
+      intensity_preset = intensity_initial + ((pressTime - SHORT_PRESS_TIME) / DIM_SPEED);
     else
-      intensity_preset = intensity_initial - ((pressTime - SHORT_PRESS_TIME) / FADE_SPEED);
+      intensity_preset = intensity_initial - ((pressTime - SHORT_PRESS_TIME) / DIM_SPEED);
 
-    // Serial.print("\t\t Intensity Preset = ");
-    // Serial.println(intensity_preset);
     leds.setBrightness(intensity_preset);       // Note; leds.show() must be called to show update
   }
-
 
   return;
 }
@@ -159,14 +145,74 @@ void ChangeIntensity(uint16_t pressTime)
 
 void updateLEDs()
 {
-  // Updates LED state
+  // Updates LED state - and does fade on/off animations
+  static bool lightsOn_last = lightsOn;
+  static uint8_t fadeStage = 0;         // Current stage of fading (kidna equal to module number)
 
-  if (lightsOn)
-    leds.fill(0xFFFFFF);
-  else
-    leds.clear();
+  if (lightsOn_last != lightsOn)        // State just changed - reset timer
+  {
+    fadingOnOff = true;
+    fadeStage = 0;
+  }
 
+  if (fadingOnOff)
+  {
+    delay(1);                           // Slow if down a little
+
+    if (lightsOn)                       // Fade on
+    {
+      modules[fadeStage] += 1;          // Increment value
+
+      if (fadeStage)                    // If not first module
+      {
+        if (modules[fadeStage] <= HALF_POINT)  // Increment last module value as well
+          modules[fadeStage-1] += 1;
+      }
+
+      if (modules[fadeStage] > HALF_POINT)     // Once we've faded up half way on one module, begin the next one
+        fadeStage++;
+
+      if (fadeStage >= sizeof(modules)) 
+      {
+        fadingOnOff = false;            // Stop once we've done all the modules
+        modules[sizeof(modules) -1] = 255; // Set last value to same as others (another random thing to make fades work properly)
+      }
+    }
+    else                                // Fade off - almost identical to fading on 
+    {
+      modules[fadeStage] -= 1;          // de-Increment value
+
+      if (fadeStage)                    // If not first module
+      {
+        if (modules[fadeStage] > HALF_POINT)   // de-Increment last module value as well
+          modules[fadeStage-1] -= 1;
+      }
+
+      if (modules[fadeStage] <= HALF_POINT)    // Once we've faded down half way on one module, begin the next one
+        fadeStage++;
+
+      if (fadeStage >= sizeof(modules)) 
+      {
+        fadingOnOff = false;            // Stop once we've done all the modules
+        modules[sizeof(modules) -1] = 0; // Set last value to same as others (another random thing to make fades work properly)
+      }
+    }
+  }
+
+  writeLEDs();
+  lightsOn_last = lightsOn;
   leds.show();
+
+  return;
+}
+
+
+void writeLEDs()
+{
+  // Writes modules buffer into leds
+
+  for (uint8_t i = 0; i < NUM_LEDS; ++i)
+    leds.setPixelColor(i, modules[0+3*i], modules[1+3*i], modules[2+3*i]);
 
   return;
 }
